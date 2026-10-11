@@ -65,3 +65,30 @@ python3 ts_download.py "https://host/path/index.m3u8" -o video.mp4
 
 Если сервер требует `Referer` или куки, передайте их через `-H`, иначе он
 может ответить 403 вместо сегмента.
+
+## Веб-версия
+
+В репозитории есть небольшой сайт поверх этого же скрипта: вставляете ссылку,
+видите прогресс, по окончании скачиваете MP4. Вход по одному общему паролю.
+Готовые файлы хранятся на сервере 60 минут, потом удаляются.
+
+- `server/app.py` — бэкенд на FastAPI, запускает `ts_download.py` и читает его прогресс
+- `frontend/` — страница (React, Tailwind, компоненты shadcn/ui, тема «Modern Minimal» из tweakcn)
+- `Dockerfile` — собирает всё в один контейнер с FFmpeg
+
+Запуск в Docker:
+
+```bash
+docker build -t ts-web .
+docker run -p 8000:8000 -e APP_PASSWORD='придумайте-пароль' ts-web
+```
+
+Откройте http://localhost:8000. Как выложить на хостинг, написано в [DEPLOY.md](DEPLOY.md).
+
+Локальная разработка без Docker:
+
+```bash
+pip install -r server/requirements.txt
+APP_PASSWORD=test uvicorn server.app:app --reload     # бэкенд на :8000
+cd frontend && npm install && npm run dev             # страница на :5173
+```
