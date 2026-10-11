@@ -13,6 +13,8 @@ Given an .m3u8 playlist instead, it downloads the segments the playlist lists
 """
 
 import argparse
+import concurrent.futures
+import http.client
 import os
 import re
 import shutil
@@ -75,7 +77,8 @@ def fetch(url, dest, headers, retries):
                 return False
             if attempt == retries or err.code < 500:
                 raise
-        except (urllib.error.URLError, TimeoutError, ConnectionError):
+        except (OSError, http.client.HTTPException):
+            # Network error, timeout or a connection cut mid-transfer: try again.
             if attempt == retries:
                 raise
         time.sleep(2 ** attempt)
@@ -152,29 +155,45 @@ def playlist_segments(url, headers, retries, variant=None):
     return segments
 
 
-def download_list(urls, workdir, headers, retries):
-    files = []
-    for n, url in enumerate(urls, 1):
-        dest = os.path.join(workdir, f"{n:06d}.ts")
-        print(f"[{n}/{len(urls)}] {url}", file=sys.stderr)
-        if not fetch(url, dest, headers, retries):
-            raise urllib.error.HTTPError(url, 404, "segment listed in playlist not found", None, None)
-        files.append(dest)
-    return files
+def download_list(urls, workdir, headers, retries, workers):
+    """Download every URL in parallel; fail if any listed segment is missing."""
+    total = len(urls)
+    jobs = [(url, os.path.join(workdir, f"{n:06d}.ts")) for n, url in enumerate(urls, 1)]
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fetch, url, dest, headers, retries): url for url, dest in jobs}
+        for future in concurrent.futures.as_completed(futures):
+            if not future.result():
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise urllib.error.HTTPError(futures[future], 404, "segment listed in playlist not found", None, None)
+            done += 1
+            print(f"\r{done}/{total} segments", end="", file=sys.stderr, flush=True)
+    print(file=sys.stderr)
+    return [dest for _, dest in jobs]
 
 
-def download_segments(make_url, first, limit, workdir, headers, retries):
+def download_segments(make_url, first, limit, workdir, headers, retries, workers):
+    """Download segments first, first+1, ... until one is missing.
+
+    The end is unknown up front, so numbers are fetched in batches of `workers`
+    at a time; everything after the first missing number is thrown away.
+    """
     files = []
     n = first
-    while limit is None or len(files) < limit:
-        url = make_url(n)
-        dest = os.path.join(workdir, f"{n:06d}.ts")
-        print(f"[{n}] {url}", file=sys.stderr)
-        if not fetch(url, dest, headers, retries):
-            print(f"[{n}] not found, stopping", file=sys.stderr)
-            break
-        files.append(dest)
-        n += 1
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        while limit is None or len(files) < limit:
+            size = workers if limit is None else min(workers, limit - len(files))
+            numbers = range(n, n + size)
+            dests = [os.path.join(workdir, f"{i:06d}.ts") for i in numbers]
+            found = list(pool.map(lambda i, d: fetch(make_url(i), d, headers, retries), numbers, dests))
+            for i, ok, dest in zip(numbers, found, dests):
+                if not ok:
+                    print(f"\nsegment {i} not found, stopping", file=sys.stderr)
+                    return files
+                files.append(dest)
+            n += size
+            print(f"\r{len(files)} segments", end="", file=sys.stderr, flush=True)
+    print(file=sys.stderr)
     return files
 
 
@@ -207,7 +226,10 @@ def parse_args(argv):
                         "(default: highest bandwidth; the list is printed while running)")
     p.add_argument("-H", "--header", action="append", default=[], metavar="'Name: value'",
                    help="extra HTTP header, can be repeated (e.g. -H 'Referer: https://site/')")
-    p.add_argument("--retries", type=int, default=3, help="attempts per segment on network errors (default: 3)")
+    p.add_argument("-j", "--workers", type=int, default=8,
+                   help="segments to download at the same time (default: 8)")
+    p.add_argument("--retries", type=int, default=5,
+                   help="attempts per segment on network errors and 5xx answers (default: 5)")
     p.add_argument("--keep", metavar="DIR", help="keep downloaded segments in DIR instead of a temp folder")
     p.add_argument("--ffmpeg", default="ffmpeg", help="path to the ffmpeg binary (default: ffmpeg from PATH)")
     return p.parse_args(argv)
@@ -226,6 +248,9 @@ def main(argv=None):
         if not sep:
             sys.exit(f"error: bad header {h!r}, expected 'Name: value'")
         headers[name.strip()] = value.strip()
+
+    if args.workers < 1:
+        sys.exit("error: --workers must be at least 1")
 
     playlist = None
     try:
@@ -251,9 +276,9 @@ def main(argv=None):
 
     try:
         if playlist is not None:
-            files = download_list(playlist, workdir, headers, args.retries)
+            files = download_list(playlist, workdir, headers, args.retries, args.workers)
         else:
-            files = download_segments(make_url, args.start, args.limit, workdir, headers, args.retries)
+            files = download_segments(make_url, args.start, args.limit, workdir, headers, args.retries, args.workers)
         if not files:
             sys.exit(f"error: segment {args.start} was not found, nothing to join")
         print(f"downloaded {len(files)} segment(s), joining into {args.output}", file=sys.stderr)
